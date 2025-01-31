@@ -20,6 +20,10 @@ func NewAPI(host string) *API {
 		host = "http://" + host
 	}
 
+	if !strings.HasSuffix(host, ":8080") {
+		host = host + ":8080"
+	}
+
 	// check if host ends with /, if not, add it
 	if !strings.HasSuffix(host, "/") {
 		host = host + "/"

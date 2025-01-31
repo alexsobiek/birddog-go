@@ -13,13 +13,20 @@ type DiscoveryNetOptions struct {
 	Interface *net.Interface
 	Logger    *log.Logger
 	Interval  time.Duration
+	Domain    string
+}
+
+type DiscoveredDevice struct {
+	api      *API
+	lastSeen time.Time
 }
 
 type BirddogDiscovery struct {
 	opts       *DiscoveryNetOptions
-	discovered map[string]*API
-	mu         sync.RWMutex
+	discovered map[string]*DiscoveredDevice
 	close      chan struct{}
+	active     bool
+	mu         sync.Mutex
 
 	onDiscover func(*API)
 	onLost     func(*API)
@@ -36,55 +43,73 @@ func NewBirddogDiscovery(opts *DiscoveryNetOptions) *BirddogDiscovery {
 
 	return &BirddogDiscovery{
 		opts:       opts,
-		discovered: make(map[string]*API),
+		discovered: make(map[string]*DiscoveredDevice),
+		active:     true,
+		close:      make(chan struct{}),
 	}
 }
 
 func (b *BirddogDiscovery) Find() {
 	entriesCh := make(chan *mdns.ServiceEntry)
-	params := &mdns.QueryParam{
+	params := mdns.QueryParam{
 		Service:     "_birddog._tcp",
 		Entries:     entriesCh,
+		Interface:   b.opts.Interface,
+		Domain:      b.opts.Domain,
 		DisableIPv6: true,
+		Logger:      b.opts.Logger,
 	}
 
+	// Producer goroutine
+
+	go func() {
+		for {
+			if !b.active {
+				return
+			}
+			err := mdns.Query(&params)
+			if err != nil {
+				log.Fatalf("mDNS Query error: %v", err)
+			}
+
+			// filter out devices that haven't been seen in a while
+			b.mu.Lock()
+			for host, dev := range b.discovered {
+				if time.Since(dev.lastSeen) > 2*b.opts.Interval {
+					delete(b.discovered, host)
+					b.onLost(dev.api)
+				}
+			}
+			b.mu.Unlock()
+			time.Sleep(b.opts.Interval)
+		}
+	}()
+
+	// Consumer loop
 	for {
 		select {
 		case <-b.close:
+			b.active = false
 			return
-		default:
-			err := mdns.Query(params)
-			if err != nil {
-				panic(err)
-			}
+		case next := <-entriesCh:
+			if next != nil {
+				b.mu.Lock()
+				addr := next.AddrV4.String()
 
-			time.Sleep(b.opts.Interval)
-
-			services := make(map[string]*API)
-
-			for i := 0; i < len(entriesCh); i++ {
-				entry := <-entriesCh
-				services[entry.Host] = NewAPI(entry.Host)
-			}
-
-			b.mu.Lock()
-			// Find new services
-			for host, api := range services {
-				if _, ok := b.discovered[host]; !ok {
-					b.discovered[host] = api
-					b.onDiscover(api)
+				if _, ok := b.discovered[addr]; ok {
+					b.discovered[addr].lastSeen = time.Now()
+					b.mu.Unlock()
+					continue
 				}
-			}
-
-			// Find lost services
-			for host, api := range b.discovered {
-				if _, ok := services[host]; !ok {
-					delete(b.discovered, host)
-					b.onLost(api)
+				dev := &DiscoveredDevice{
+					api:      NewAPI(addr),
+					lastSeen: time.Now(),
 				}
-			}
 
-			b.mu.Unlock()
+				b.discovered[next.AddrV4.String()] = dev
+				b.mu.Unlock()
+				b.onDiscover(dev.api)
+			}
 		}
 	}
 }
