@@ -3,7 +3,6 @@ package birddog
 import (
 	"log"
 	"net"
-	"sync"
 	"time"
 
 	"github.com/hashicorp/mdns"
@@ -16,20 +15,14 @@ type DiscoveryNetOptions struct {
 	Domain    string
 }
 
-type DiscoveredDevice struct {
-	api      *API
-	lastSeen time.Time
-}
-
 type BirddogDiscovery struct {
 	opts       *DiscoveryNetOptions
-	discovered map[string]*DiscoveredDevice
+	discovered map[string]*Device
 	close      chan struct{}
 	active     bool
-	mu         sync.Mutex
 
 	onDiscover func(*API)
-	onLost     func(*API)
+	onTimeout  func(*API)
 }
 
 func NewBirddogDiscovery(opts *DiscoveryNetOptions) *BirddogDiscovery {
@@ -43,7 +36,7 @@ func NewBirddogDiscovery(opts *DiscoveryNetOptions) *BirddogDiscovery {
 
 	return &BirddogDiscovery{
 		opts:       opts,
-		discovered: make(map[string]*DiscoveredDevice),
+		discovered: make(map[string]*Device),
 		active:     true,
 		close:      make(chan struct{}),
 	}
@@ -71,16 +64,6 @@ func (b *BirddogDiscovery) Find() {
 			if err != nil {
 				log.Fatalf("mDNS Query error: %v", err)
 			}
-
-			// filter out devices that haven't been seen in a while
-			b.mu.Lock()
-			for host, dev := range b.discovered {
-				if time.Since(dev.lastSeen) > 2*b.opts.Interval {
-					delete(b.discovered, host)
-					b.onLost(dev.api)
-				}
-			}
-			b.mu.Unlock()
 			time.Sleep(b.opts.Interval)
 		}
 	}()
@@ -93,22 +76,31 @@ func (b *BirddogDiscovery) Find() {
 			return
 		case next := <-entriesCh:
 			if next != nil {
-				b.mu.Lock()
 				addr := next.AddrV4.String()
 
+				// attempt to ping device
+
 				if _, ok := b.discovered[addr]; ok {
-					b.discovered[addr].lastSeen = time.Now()
-					b.mu.Unlock()
 					continue
 				}
-				dev := &DiscoveredDevice{
-					api:      NewAPI(addr),
-					lastSeen: time.Now(),
+
+				dev := NewDevice(NewAPI(next.AddrV4.String()))
+
+				dev.OnAvailable = func() {
+					b.onDiscover(dev.api)
+				}
+
+				dev.OnUnavailable = func() {
+					b.onTimeout(dev.api)
+				}
+
+				dev.OnError = func(err error) {
+					b.opts.Logger.Printf("Error: %v", err)
 				}
 
 				b.discovered[next.AddrV4.String()] = dev
-				b.mu.Unlock()
-				b.onDiscover(dev.api)
+
+				go dev.Query(b.opts.Interval)
 			}
 		}
 	}
@@ -118,10 +110,13 @@ func (b *BirddogDiscovery) OnDiscover(f func(*API)) {
 	b.onDiscover = f
 }
 
-func (b *BirddogDiscovery) OnLost(f func(*API)) {
-	b.onLost = f
+func (b *BirddogDiscovery) OnTimeout(f func(*API)) {
+	b.onTimeout = f
 }
 
 func (b *BirddogDiscovery) Close() {
 	close(b.close)
+	for _, dev := range b.discovered {
+		dev.Close()
+	}
 }
