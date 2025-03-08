@@ -8,10 +8,12 @@ import (
 	"net/http"
 	"reflect"
 	"strings"
+	"time"
 )
 
 type API struct {
-	Host string
+	Host   string
+	client *http.Client
 }
 
 func NewAPI(host string) *API {
@@ -31,6 +33,9 @@ func NewAPI(host string) *API {
 
 	return &API{
 		Host: host,
+		client: &http.Client{
+			Timeout: 5 * time.Second,
+		},
 	}
 }
 
@@ -108,7 +113,7 @@ func (a *API) encode(body interface{}) (io.Reader, error) {
 }
 
 func (a *API) get(endpoint string, target interface{}) (interface{}, error) {
-	res, err := http.Get(fmt.Sprintf("%s%s", a.Host, endpoint))
+	res, err := a.client.Get(fmt.Sprintf("%s%s", a.Host, endpoint))
 
 	if err != nil {
 		return nil, err
@@ -130,7 +135,7 @@ func (a *API) post(endpoint string, body interface{}, target interface{}) (inter
 		return nil, err
 	}
 
-	res, err := http.Post(fmt.Sprintf("%s%s", a.Host, endpoint), "application/json", r)
+	res, err := a.client.Post(fmt.Sprintf("%s%s", a.Host, endpoint), "application/json", r)
 
 	if err != nil {
 		return nil, err
